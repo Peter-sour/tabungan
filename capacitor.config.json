@@ -1,0 +1,6 @@
+{
+  "appId": "com.example.tabungan",
+  "appName": "tabungan",
+  "webDir": "dist",
+  "bundledWebRuntime": false
+}
