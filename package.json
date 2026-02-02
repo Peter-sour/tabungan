@@ -13,6 +13,7 @@
     "@capacitor/android": "^8.0.2",
     "@capacitor/core": "^8.0.2",
     "@capacitor/ios": "^8.0.2",
+    "@capacitor/local-notifications": "^8.0.0",
     "@ionic/react": "^8.7.17",
     "@ionic/react-router": "^8.7.17",
     "autoprefixer": "^10.4.24",

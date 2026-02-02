@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import axios from 'axios';
 import { 
   Plus, Minus, History, User, ChevronRight, X, Wallet, 
@@ -6,12 +6,21 @@ import {
   ShieldCheck, CheckCircle2, Clock, LogOut, Lock, Mail
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { LocalNotifications } from '@capacitor/local-notifications';
 
-// Konfigurasi Axios Dasar
+// --- Konfigurasi Axios ---
 const api = axios.create({
-  baseURL: 'https://mollusklike-intactly-kennedi.ngrok-free.dev/api',
-  headers: { 'ngrok-skip-browser-warning': 'true' }
+  baseURL: 'https://tabungan-backend.vercel.app/api',
 });
+
+// Interceptor untuk menyisipkan token secara otomatis
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem('token');
+  if (token) {
+    config.headers['x-auth-token'] = token;
+  }
+  return config;
+}, (error) => Promise.reject(error));
 
 const App = () => {
   // --- STATE UTAMA ---
@@ -25,7 +34,8 @@ const App = () => {
   const [balance, setBalance] = useState(0);
   const [transactions, setTransactions] = useState([]);
   const [notifications, setNotifications] = useState([]);
-  
+  const lastTxIdRef = useRef(null); // Menyimpan ID transaksi terakhir untuk pengecekan notif
+
   // --- STATE UI ---
   const [view, setView] = useState('home'); 
   const [showBalance, setShowBalance] = useState(false);
@@ -33,42 +43,100 @@ const App = () => {
   const [showModal, setShowModal] = useState(null); 
   const [formData, setFormData] = useState({ amount: '', note: '' });
 
-  const fetchData = async () => {
+  // --- FUNGSI NOTIFIKASI NATIVE ---
+  const requestNotificationPermission = async () => {
+    const status = await LocalNotifications.checkPermissions();
+    if (status.display !== 'granted') {
+      await LocalNotifications.requestPermissions();
+    }
+  };
+
+  const triggerNativeNotification = async (notifData) => {
+    try {
+      await LocalNotifications.schedule({
+        notifications: [
+          {
+            title: notifData.type === 'plus' ? "Uang Masuk! 💰" : "Uang Keluar! 💸",
+            body: getNotifMessage(notifData),
+            id: Date.now(), 
+            schedule: { at: new Date(Date.now() + 100) },
+            sound: 'default',
+            actionTypeId: "",
+            extra: null
+          }
+        ]
+      });
+    } catch (err) {
+      console.error("Gagal mengirim notifikasi native", err);
+    }
+  };
+
+  const getNotifMessage = (notif) => {
+    const action = notif.type === 'plus' ? 'menambahkan' : 'menarik';
+    const amountStr = `Rp ${parseInt(notif.amount).toLocaleString('id-ID')}`;
+    return notif.sender === currentUser 
+      ? `Anda telah ${action} ${amountStr}` 
+      : `${notif.sender} telah ${action} ${amountStr}`;
+  };
+
+  // --- FETCH DATA ---
+  const fetchData = useCallback(async (isInitialFetch = false) => {
     if (!isLoggedIn) return;
     try {
-      const config = { headers: { 'x-auth-token': localStorage.getItem('token') } };
-      const res = await api.get('/ledger/data', config);
-      setBalance(res.data.balance);
-      setTransactions(res.data.transactions);
+      const res = await api.get('/ledger/data');
+      const { balance: newBalance, transactions: newTransactions } = res.data;
       
-      const newNotifs = res.data.transactions.slice(0, 5).map(tx => ({
+      setBalance(newBalance);
+      setTransactions(newTransactions);
+
+      if (newTransactions.length > 0) {
+        const latestTx = newTransactions[0];
+
+        // LOGIKA NOTIFIKASI: 
+        // Jika ID berbeda dari ID terakhir DAN bukan fetch pertama kali (cegah spam notif saat baru buka app)
+        if (!isInitialFetch && lastTxIdRef.current && latestTx._id !== lastTxIdRef.current) {
+          // Hanya trigger jika sender bukan kita (karena kita sudah trigger manual di handleSubmit)
+          if (latestTx.user !== currentUser) {
+            triggerNativeNotification({
+              sender: latestTx.user,
+              amount: latestTx.amount,
+              type: latestTx.type
+            });
+          }
+        }
+        lastTxIdRef.current = latestTx._id;
+      }
+
+      setNotifications(newTransactions.slice(0, 5).map(tx => ({
         id: tx._id,
         sender: tx.user,
         amount: tx.amount,
         type: tx.type,
         time: new Date(tx.date).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }),
-      }));
-      setNotifications(newNotifs);
+      })));
     } catch (err) {
-      console.error("Gagal sinkron");
+      console.error("Gagal sinkron data");
+      if (err.response?.status === 401) handleLogout();
     }
-  };
+  }, [isLoggedIn, currentUser]);
 
   useEffect(() => {
     if (isLoggedIn) {
-      fetchData();
+      requestNotificationPermission();
+      fetchData(true); // Initial fetch
       const timer = setTimeout(() => setIsAppReady(true), 2500);
       return () => clearTimeout(timer);
     }
-  }, [isLoggedIn]);
+  }, [isLoggedIn, fetchData]);
 
   useEffect(() => {
     if (isLoggedIn && isAppReady) {
-      const interval = setInterval(fetchData, 15000);
+      const interval = setInterval(() => fetchData(false), 15000);
       return () => clearInterval(interval);
     }
-  }, [isLoggedIn, isAppReady]);
+  }, [isLoggedIn, isAppReady, fetchData]);
 
+  // --- HANDLERS ---
   const handleAuth = async (e) => {
     e.preventDefault();
     const endpoint = isRegister ? '/auth/register' : '/auth/login';
@@ -98,14 +166,25 @@ const App = () => {
   const handleSubmitTransaction = async (e) => {
     e.preventDefault();
     if (!formData.amount) return;
+    const amountVal = parseInt(formData.amount);
+    const typeVal = showModal === 'nabung' ? 'plus' : 'minus';
+
     try {
       await api.post('/ledger/add', {
-        type: showModal === 'nabung' ? 'plus' : 'minus',
-        amount: parseInt(formData.amount),
+        type: typeVal,
+        amount: amountVal,
         note: formData.note || (showModal === 'nabung' ? 'Setoran' : 'Penarikan'),
         user: currentUser
-      }, { headers: { 'x-auth-token': localStorage.getItem('token') } });
-      fetchData();
+      });
+
+      // NOTIFIKASI INSTAN UNTUK DIRI SENDIRI
+      triggerNativeNotification({
+        sender: currentUser,
+        amount: amountVal,
+        type: typeVal
+      });
+
+      fetchData(false);
       setFormData({ amount: '', note: '' });
       setShowModal(null);
     } catch (err) {
@@ -113,81 +192,35 @@ const App = () => {
     }
   };
 
-  const getNotifMessage = (notif) => {
-    const action = notif.type === 'plus' ? 'menambahkan' : 'menarik';
-    const amountStr = `Rp ${notif.amount.toLocaleString('id-ID')}`;
-    return notif.sender === currentUser 
-      ? `Anda telah ${action} ${amountStr}` 
-      : `${notif.sender} telah ${action} ${amountStr}`;
-  };
-
-  // --- 1. WELCOME SCREEN ---
+  // --- UI RENDER (Splash Screen, Login, Dashboard) ---
   if (isLoggedIn && !isAppReady) {
     return (
-     <div className="min-h-screen bg-slate-950 flex items-center justify-center overflow-hidden relative">
-        {/* Lingkaran Biru Melingkar (Glow Effect) */}
-        <motion.div 
-          initial={{ scale: 0, opacity: 0 }}
-          animate={{ scale: [1, 1.5, 1], opacity: [0.3, 0.6, 0.3] }}
-          transition={{ duration: 2, repeat: Infinity, ease: "easeInOut" }}
-          className="absolute w-[300px] h-[300px] bg-indigo-600 rounded-full blur-[100px]"
-        />
-        
+      <div className="min-h-screen bg-slate-950 flex items-center justify-center relative overflow-hidden">
+        <motion.div animate={{ scale: [1, 1.2, 1], opacity: [0.3, 0.5, 0.3] }} transition={{ duration: 3, repeat: Infinity }} className="absolute w-80 h-80 bg-indigo-600 rounded-full blur-[100px]" />
         <div className="relative z-10 text-center">
-          <motion.div
-            initial={{ y: 20, opacity: 0 }}
-            animate={{ y: 0, opacity: 1 }}
-            transition={{ duration: 0.8 }}
-          >
-            <h2 className="text-[10px] font-black uppercase tracking-[0.5em] text-indigo-400 mb-2">Authorized Access</h2>
-            <motion.h1 
-              initial={{ letterSpacing: "0.2em", opacity: 0 }}
-              animate={{ letterSpacing: "0.5em", opacity: 1 }}
-              transition={{ duration: 1.5, delay: 0.2 }}
-              className="text-white text-4xl font-black uppercase"
-            >
-              WELCOME
-            </motion.h1>
-            <motion.p 
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 0.5 }}
-              transition={{ delay: 1.2 }}
-              className="text-white text-[10px] font-bold mt-4 uppercase tracking-widest"
-            >
-              {currentUser}
-            </motion.p>
-          </motion.div>
-          
-          {/* Animated Ring */}
-          <svg className="w-20 h-20 mx-auto mt-10" viewBox="0 0 100 100">
-            <motion.circle
-              cx="50" cy="50" r="40"
-              stroke="#4f46e5" strokeWidth="4" fill="transparent"
-              initial={{ pathLength: 0, rotate: 0 }}
-              animate={{ pathLength: 1, rotate: 360 }}
-              transition={{ duration: 2, repeat: Infinity, ease: "linear" }}
-            />
-          </svg>
+          <h2 className="text-[10px] font-black uppercase tracking-[0.5em] text-indigo-400 mb-2">Syncing Data</h2>
+          <h1 className="text-white text-4xl font-black tracking-widest">WELCOME</h1>
+          <p className="text-white/40 text-[10px] mt-4 font-bold uppercase">{currentUser}</p>
         </div>
       </div>
     );
   }
 
-  // --- 2. LOGIN VIEW ---
   if (!isLoggedIn) {
     return (
       <div className="min-h-screen bg-[#F8FAFC] flex items-center justify-center p-6">
         <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="w-full max-w-md bg-white rounded-[3rem] shadow-2xl p-10">
-          <div className="text-center mb-10 text-slate-900">
-            <div className="w-16 h-16 bg-indigo-600 rounded-3xl mx-auto mb-6 flex items-center justify-center text-white"><Wallet size={30} /></div>
-            <h2 className="text-2xl font-black uppercase tracking-tighter">Selamat Datang</h2>
-            <p className="text-slate-400 text-[10px] font-black uppercase tracking-widest mt-2">Sistem Tabungan Bersama</p>
+          <div className="text-center mb-10">
+            <div className="w-16 h-16 bg-indigo-600 rounded-3xl mx-auto mb-6 flex items-center justify-center text-white shadow-lg"><Wallet size={30} /></div>
+            <h2 className="text-2xl font-black uppercase tracking-tight text-slate-900">{isRegister ? 'Buat Akun' : 'Selamat Datang'}</h2>
           </div>
           <form onSubmit={handleAuth} className="space-y-4">
-            {isRegister && <input type="text" placeholder="NAMA LENGKAP" className="w-full bg-slate-50 rounded-2xl p-4 text-xs font-black outline-none" onChange={(e) => setAuthData({...authData, name: e.target.value})} required />}
-            <input type="email" placeholder="EMAIL" className="w-full bg-slate-50 rounded-2xl p-4 text-xs font-black outline-none" onChange={(e) => setAuthData({...authData, email: e.target.value})} required />
-            <input type="password" placeholder="PASSWORD" className="w-full bg-slate-50 rounded-2xl p-4 text-xs font-black outline-none" onChange={(e) => setAuthData({...authData, password: e.target.value})} required />
-            <button className="w-full bg-indigo-600 text-white p-5 rounded-2xl font-black text-xs uppercase shadow-xl">Masuk</button>
+            {isRegister && <input type="text" placeholder="NAMA LENGKAP" className="w-full bg-slate-50 rounded-2xl p-4 text-xs font-black outline-none border border-transparent focus:border-indigo-600" onChange={(e) => setAuthData({...authData, name: e.target.value})} required />}
+            <input type="email" placeholder="EMAIL" className="w-full bg-slate-50 rounded-2xl p-4 text-xs font-black outline-none border border-transparent focus:border-indigo-600" onChange={(e) => setAuthData({...authData, email: e.target.value})} required />
+            <input type="password" placeholder="PASSWORD" className="w-full bg-slate-50 rounded-2xl p-4 text-xs font-black outline-none border border-transparent focus:border-indigo-600" onChange={(e) => setAuthData({...authData, password: e.target.value})} required />
+            <button className="w-full bg-indigo-600 text-white p-5 rounded-2xl font-black text-xs uppercase shadow-xl active:scale-95 transition-all">
+              {isRegister ? 'Daftar' : 'Masuk'}
+            </button>
           </form>
           <button onClick={() => setIsRegister(!isRegister)} className="w-full mt-6 text-[10px] font-black text-slate-400 uppercase tracking-widest">{isRegister ? 'Sudah punya akun? Login' : 'Belum punya akun? Daftar'}</button>
         </motion.div>
@@ -195,17 +228,16 @@ const App = () => {
     );
   }
 
-  // --- 3. DASHBOARD VIEW ---
   return (
-    <div className="min-h-screen bg-[#F8FAFC] font-sans pb-28">
+    <div className="min-h-screen bg-[#F8FAFC] pb-28">
       {/* Header */}
       <div className="bg-indigo-700 px-6 pt-12 pb-20 rounded-b-[3.5rem] shadow-xl relative overflow-hidden">
-        <div className="flex justify-between items-center mb-8 relative z-10 text-white font-black">
+        <div className="flex justify-between items-center mb-8 text-white relative z-10">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 bg-white/20 rounded-xl flex items-center justify-center"><User size={20} /></div>
-            <h1 className="text-sm uppercase">{currentUser}</h1>
+            <h1 className="text-sm font-black uppercase">{currentUser}</h1>
           </div>
-          <button onClick={() => setShowNotifications(true)} className="p-2.5 bg-white/10 rounded-xl"><Bell size={20} /></button>
+          <button onClick={() => setShowNotifications(true)} className="p-2.5 bg-white/10 rounded-xl active:scale-90"><Bell size={20} /></button>
         </div>
 
         {/* Card Saldo */}
@@ -219,7 +251,7 @@ const App = () => {
              <h2 className="text-4xl font-black tracking-tighter">{showBalance ? balance.toLocaleString('id-ID') : "••••••••"}</h2>
           </div>
           <div className="flex items-center gap-2 opacity-80 text-[10px] font-black uppercase tracking-widest">
-            <ShieldCheck size={12} className="text-emerald-400" /> Protected Ledger
+            <ShieldCheck size={12} className="text-emerald-400" /> Secure Ledger
           </div>
         </div>
       </div>
@@ -231,7 +263,7 @@ const App = () => {
           <span className="text-[10px] font-black uppercase tracking-widest">Nabung</span>
         </button>
         <button onClick={() => setShowModal('tarik')} className="bg-white p-6 rounded-[2.2rem] shadow-xl flex flex-col items-center gap-2 active:scale-95 transition-all">
-          <div className="w-12 h-12 bg-slate-50 text-slate-600 rounded-2xl flex items-center justify-center"><Minus size={24} /></div>
+          <div className="w-12 h-12 bg-rose-50 text-rose-600 rounded-2xl flex items-center justify-center"><Minus size={24} /></div>
           <span className="text-[10px] font-black uppercase tracking-widest">Tarik</span>
         </button>
       </div>
@@ -240,8 +272,8 @@ const App = () => {
       <div className="px-6 mt-10">
         <AnimatePresence mode="wait">
           {view === 'home' ? (
-            <motion.div key="home" initial={{ y: 10, opacity: 0 }} animate={{ y: 0, opacity: 1 }}>
-              <h3 className="font-black text-slate-800 text-[11px] uppercase tracking-[0.2em] mb-5">Riwayat Transaksi</h3>
+            <motion.div key="home" initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
+              <h3 className="font-black text-slate-800 text-[11px] uppercase tracking-widest mb-5">Riwayat Transaksi</h3>
               <div className="space-y-3">
                 {transactions.map(tx => (
                   <div key={tx._id} className="bg-white p-5 rounded-[2rem] flex items-center justify-between border border-slate-100 shadow-sm">
@@ -261,9 +293,9 @@ const App = () => {
             </motion.div>
           ) : (
             <motion.div key="profile" className="text-center space-y-6">
-              <div className="bg-white p-12 rounded-[3.5rem] shadow-sm border border-slate-100 font-black uppercase">
-                <div className="w-24 h-24 bg-slate-900 rounded-[2.5rem] mx-auto mb-4 flex items-center justify-center text-white text-3xl">{currentUser.charAt(0)}</div>
-                <h2 className="text-xl text-slate-900">{currentUser}</h2>
+              <div className="bg-white p-12 rounded-[3.5rem] shadow-sm border border-slate-100">
+                <div className="w-24 h-24 bg-slate-900 rounded-[2.5rem] mx-auto mb-4 flex items-center justify-center text-white text-3xl font-black uppercase">{currentUser.charAt(0)}</div>
+                <h2 className="text-xl font-black text-slate-900 uppercase">{currentUser}</h2>
               </div>
               <button onClick={handleLogout} className="w-full bg-slate-900 text-white p-6 rounded-[2rem] flex items-center justify-center gap-3 font-black text-[10px] uppercase shadow-xl"><LogOut size={18} /> Logout</button>
             </motion.div>
@@ -277,7 +309,7 @@ const App = () => {
         <button onClick={() => setView('profile')} className={view === 'profile' ? 'text-white' : 'text-slate-600'}><User size={22} /></button>
       </div>
 
-      {/* --- MODAL NOTIFIKASI --- */}
+      {/* MODAL NOTIFIKASI */}
       <AnimatePresence>
         {showNotifications && (
           <motion.div initial={{ x: '100%' }} animate={{ x: 0 }} exit={{ x: '100%' }} className="fixed inset-0 bg-[#F8FAFC] z-[100] flex flex-col">
@@ -300,16 +332,16 @@ const App = () => {
         )}
       </AnimatePresence>
 
-      {/* --- MODAL INPUT TRANSAKSI --- */}
+      {/* MODAL INPUT */}
       <AnimatePresence>
         {showModal && (
           <div className="fixed inset-0 z-[60] flex items-end justify-center">
             <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setShowModal(null)} className="absolute inset-0 bg-slate-950/80 backdrop-blur-md" />
             <motion.div initial={{ y: "100%" }} animate={{ y: 0 }} exit={{ y: "100%" }} className="relative w-full bg-white rounded-t-[3.5rem] p-10 max-w-lg shadow-2xl">
-              <h3 className="text-xl font-black uppercase tracking-widest mb-10 text-slate-900">{showModal === 'nabung' ? 'Tambah' : 'Tarik'}</h3>
+              <h3 className="text-xl font-black uppercase tracking-widest mb-10 text-slate-900">{showModal === 'nabung' ? 'Tambah Tabungan' : 'Tarik Saldo'}</h3>
               <form onSubmit={handleSubmitTransaction} className="space-y-10">
-                <input type="number" placeholder="Rp 0" className="w-full py-4 text-4xl font-black border-b-4 border-slate-100 focus:border-indigo-600 outline-none transition-all text-slate-900" onChange={(e) => setFormData({...formData, amount: e.target.value})} autoFocus />
-                <input type="text" placeholder="Catatan" className="w-full py-2 border-b text-sm font-bold outline-none border-slate-100 focus:border-indigo-600 text-slate-900" onChange={(e) => setFormData({...formData, note: e.target.value})} />
+                <input type="number" placeholder="Rp 0" className="w-full py-4 text-4xl font-black border-b-4 border-slate-100 focus:border-indigo-600 outline-none text-slate-900" onChange={(e) => setFormData({...formData, amount: e.target.value})} autoFocus />
+                <input type="text" placeholder="Catatan (opsional)" className="w-full py-2 border-b text-sm font-bold outline-none border-slate-100 focus:border-indigo-600 text-slate-900" onChange={(e) => setFormData({...formData, note: e.target.value})} />
                 <button type="submit" className={`w-full p-6 rounded-[2rem] text-white font-black text-xs uppercase tracking-widest ${showModal === 'nabung' ? 'bg-indigo-600' : 'bg-slate-900'}`}>Konfirmasi</button>
               </form>
             </motion.div>
